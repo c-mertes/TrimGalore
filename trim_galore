@@ -7,6 +7,18 @@ use File::Spec;
 use File::Basename;
 use Cwd;
 
+# Conditionally load Parallel::ForkManager
+my $PARALLEL_AVAILABLE = 0;
+eval {
+    require Parallel::ForkManager;
+    Parallel::ForkManager->import();
+    $PARALLEL_AVAILABLE = 1;
+};
+
+if (!$PARALLEL_AVAILABLE) {
+    warn "Note: Parallel::ForkManager not available. --parallel_fastqc option will be ignored.\n" if @ARGV && grep(/--parallel_fastqc/, @ARGV);
+}
+
 ## This program is Copyright (C) 2012-23, Felix Krueger (fkrueger@altoslabs.com)
 ## Edited by Frankie James (github.com/fjames003) for multi-core support
 
@@ -39,7 +51,7 @@ my $cutadapt_version;
 my $python_version;
 
 
-my ($compression_path,$decompression_path,$cores,$cutoff,$adapter,$stringency,$rrbs,$length_cutoff,$keep,$fastqc,$non_directional,$phred_encoding,$fastqc_args,$trim,$gzip,$validate,$retain,$length_read_1,$length_read_2,$a2,$error_rate,$output_dir,$no_report_file,$dont_gzip,$clip_r1,$clip_r2,$three_prime_clip_r1,$three_prime_clip_r2,$nextera,$stranded_illumina,$small_rna,$path_to_cutadapt,$illumina,$max_length,$maxn,$maxn_fraction,$trim_n,$hardtrim5,$clock,$polyA,$hardtrim3,$nextseq,$basename,$consider_already_trimmed,$umi_from_r2) = process_commandline();
+my ($compression_path,$decompression_path,$cores,$cutoff,$adapter,$stringency,$rrbs,$length_cutoff,$keep,$fastqc,$non_directional,$phred_encoding,$fastqc_args,$trim,$gzip,$validate,$retain,$length_read_1,$length_read_2,$a2,$error_rate,$output_dir,$no_report_file,$dont_gzip,$clip_r1,$clip_r2,$three_prime_clip_r1,$three_prime_clip_r2,$nextera,$stranded_illumina,$small_rna,$path_to_cutadapt,$illumina,$max_length,$maxn,$maxn_fraction,$trim_n,$hardtrim5,$clock,$polyA,$hardtrim3,$nextseq,$basename,$consider_already_trimmed,$umi_from_r2,$parallel_fastqc) = process_commandline();
 
 
 my $report_message; # stores result of adapter auto-detection
@@ -1497,14 +1509,10 @@ sub trim{
         }
 
         if ($fastqc){
-            warn "\n  >>> Now running FastQC on the data <<<\n\n";
-            # sleep (1);
-            if ($fastqc_args){
-                system ("$path_to_fastqc $fastqc_args $output_dir$output_filename");
-            }
-            else{
-                system ("$path_to_fastqc $output_dir$output_filename");
-            }
+            # Use parallel FastQC if enabled, otherwise run sequentially
+            my $num_cores = ($cores =~ /-j (\d+)/) ? $1 : (($cores && $cores =~ /^\d+$/) ? $cores : 1);
+            my $processes = ($parallel_fastqc && $num_cores > 1) ? $num_cores : 1;
+            run_fastqc_parallel([$output_filename], $path_to_fastqc, $fastqc_args, $output_dir, $processes);
         }
     }
 
@@ -1547,23 +1555,10 @@ sub trim{
 
             ### RUNNING FASTQC
             if ($fastqc){
-                warn "\n  >>> Now running FastQC on the validated data $val_1<<<\n\n";
-                if ($fastqc_args){
-                    system ("$path_to_fastqc $fastqc_args $output_dir$val_1");
-                }
-                else{
-                    system ("$path_to_fastqc $output_dir$val_1");
-                }
-
-                warn "\n  >>> Now running FastQC on the validated data $val_2<<<\n\n";
-                #sleep (3);
-
-                if ($fastqc_args){
-                    system ("$path_to_fastqc $fastqc_args $output_dir$val_2");
-                }
-                else{
-                    system ("$path_to_fastqc $output_dir$val_2");
-                }
+                # Use parallel FastQC if enabled, otherwise run sequentially  
+                my $num_cores = ($cores =~ /-j (\d+)/) ? $1 : (($cores && $cores =~ /^\d+$/) ? $cores : 1);
+                my $processes = ($parallel_fastqc && $num_cores > 1) ? $num_cores : 1;
+                run_fastqc_parallel([$val_1, $val_2], $path_to_fastqc, $fastqc_args, $output_dir, $processes);
             }
 
             warn "Deleting both intermediate output files $file_1 and $file_2\n";
@@ -2392,6 +2387,59 @@ sub autodetect_polyA_type{
 
 ###########################################################################
 
+sub run_fastqc_parallel {
+    my ($files_ref, $path_to_fastqc, $fastqc_args, $output_dir, $max_processes) = @_;
+    
+    return unless @$files_ref;
+    
+    # If parallel_fastqc is not enabled, Parallel::ForkManager is not available, 
+    # we have only one file, or only one process requested, run sequentially
+    if (!$max_processes || $max_processes == 1 || @$files_ref == 1 || !$PARALLEL_AVAILABLE) {
+        if (!$PARALLEL_AVAILABLE && $max_processes > 1) {
+            warn "Warning: Parallel::ForkManager not available. Running FastQC sequentially.\n";
+        }
+        
+        foreach my $file (@$files_ref) {
+            warn "\n  >>> Now running FastQC on $file <<<\n\n";
+            if ($fastqc_args) {
+                system ("$path_to_fastqc $fastqc_args $output_dir$file");
+            } else {
+                system ("$path_to_fastqc $output_dir$file");
+            }
+        }
+        return;
+    }
+    
+    # Run FastQC in parallel using Parallel::ForkManager
+    my $pm = Parallel::ForkManager->new($max_processes);
+    
+    warn "\n  >>> Running FastQC in parallel on " . scalar(@$files_ref) . " files using $max_processes processes <<<\n\n";
+    
+    foreach my $file (@$files_ref) {
+        # Start parallel process
+        $pm->start and next;
+        
+        # Child process - run FastQC
+        warn "Running FastQC on $file in parallel...\n";
+        my $exit_code;
+        if ($fastqc_args) {
+            $exit_code = system ("$path_to_fastqc $fastqc_args $output_dir$file");
+        } else {
+            $exit_code = system ("$path_to_fastqc $output_dir$file");
+        }
+        
+        # Exit child process with appropriate code
+        $pm->finish($exit_code >> 8);
+    }
+    
+    # Wait for all child processes to complete
+    $pm->wait_all_children;
+    
+    warn "All FastQC processes completed.\n\n";
+}
+
+###########################################################################
+
 sub process_commandline{
     my $help;
     my $quality;
@@ -2441,6 +2489,7 @@ sub process_commandline{
     my $decompression_path = 'gzip'; # default
     my $consider_already_trimmed;
     my $implicon;
+    my $parallel_fastqc;
 
     my $command_line = GetOptions ('help|man' => \$help,
                  'q|quality=i' => \$quality,
@@ -2488,6 +2537,7 @@ sub process_commandline{
                  'j|cores=i' => \$cores,
                  'consider_already_trimmed=i' => \$consider_already_trimmed,
                  'implicon'  => \$implicon,
+                 'parallel_fastqc' => \$parallel_fastqc,
       );
 
 	### EXIT ON ERROR if there were errors with any of the supplied options
@@ -3091,7 +3141,7 @@ VERSION
         $umi_from_r2 = 8;
     }
 
-    return ($compression_path,$decompression_path,$cores,$quality,$adapter,$stringency,$rrbs,$length_cutoff,$keep,$fastqc,$non_directional,$phred_encoding,$fastqc_args,$trim,$gzip,$validate,$retain,$length_read_1,$length_read_2,$adapter2,$error_rate,$output_dir,$no_report_file,$dont_gzip,$clip_r1,$clip_r2,$three_prime_clip_r1,$three_prime_clip_r2,$nextera,$stranded_illumina,$small_rna,$path_to_cutadapt,$illumina,$max_length,$maxn,$maxn_fraction,$trim_n,$hardtrim5,$clock,$polyA,$hardtrim3,$nextseq,$basename,$consider_already_trimmed,$umi_from_r2);
+    return ($compression_path,$decompression_path,$cores,$quality,$adapter,$stringency,$rrbs,$length_cutoff,$keep,$fastqc,$non_directional,$phred_encoding,$fastqc_args,$trim,$gzip,$validate,$retain,$length_read_1,$length_read_2,$adapter2,$error_rate,$output_dir,$no_report_file,$dont_gzip,$clip_r1,$clip_r2,$three_prime_clip_r1,$three_prime_clip_r2,$nextera,$stranded_illumina,$small_rna,$path_to_cutadapt,$illumina,$max_length,$maxn,$maxn_fraction,$trim_n,$hardtrim5,$clock,$polyA,$hardtrim3,$nextseq,$basename,$consider_already_trimmed,$umi_from_r2,$parallel_fastqc);
 }
 
 sub Ncounter{
@@ -3151,6 +3201,12 @@ trim_galore [options] <filename(s)>
                         --fastqc_args "--nogroup --outdir /home/". Passing extra arguments will
                         automatically invoke FastQC, so --fastqc does not have to be specified
                         separately.
+
+--parallel_fastqc       Run FastQC processes in parallel when processing multiple files. This option
+                        works in conjunction with the --cores parameter to determine the number of
+                        parallel FastQC processes. For paired-end data, both validated files will be
+                        processed in parallel. Only effective when --fastqc is also specified.
+                        Note: This requires the Parallel::ForkManager Perl module to be installed.
 
 -a/--adapter <STRING>   Adapter sequence to be trimmed. If not specified explicitly, Trim Galore will
                         try to auto-detect whether the Illumina universal, Nextera transposase or Illumina
